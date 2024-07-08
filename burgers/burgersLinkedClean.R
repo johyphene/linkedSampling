@@ -460,7 +460,7 @@ hats <- inv(t(hTilde) %*% invR %*% hTilde)%*%t(hTilde) %*% invR %*% yT
 # betaHat <- hats[(d+1):(d+p+1),]
 # thetaHat <- gpModel2@theta_hat[1:d]
 # betaHat <- gpModel2@theta_hat[(d+1):(d+p+1)]
-thetaGat <- 0
+thetaHat <- 0
 betaHat <- gpModel2@theta_hat
 B <- matrix(0,nrow = d, ncol = m)
 Q <- invR %*% hTilde %*% inv(t(hTilde) %*% invR %*% hTilde) %*% t(hTilde) %*% invR - invR
