@@ -1,0 +1,845 @@
+---
+title: "Linked Emulator"
+author: "Joey Lyon"
+date: "2025-01-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+We start by defining the functions for the Linked Emulator, as well as a method to produce correlated samples, if desired. The 4 functions are fEmulator, gEmulator, linkedSampling, and linkedEmulator. The first 3 are all called within a single call of the linkedEmulator function. \
+
+
+*fEmulator(fLocs, fOutput, fLocsPred, kernel)* - performs parallel partial emulation for the given untested inputs based on the provided design. \
+**Inputs:** 
+
+fLocs - $n \times m$ matrix of design/training inputs for the $f$ emulator. \
+        fOutput - $n \times d$ matrix of the corresponding outputs to the provided inputs. \
+        fLocsPred - $N \times m$ matrix of untested inputs. \
+        kernel - The name of the desired corr. function, defaults to Matern 5/2. \
+
+**Outputs:** 
+
+fModel - Model based on the provided design. Contains range parameters among other things. This model is always built with a constant trend. \
+          fPred - Predictive mean and standard deviation from the PPE for the untested inputs provided (also includes upper and lower 95 values).  \
+
+~-~
+          
+*gEmulator(gLocs, gOutput, gLocsPred, trend, kernel)* - performs parallel partial emulation for the given untested inputs based on the provided design. \
+**Inputs:** 
+
+gLocs - $n \times (d+p)$ matrix of design/training inputs for the $g$ emulator. The external $z$ inputs are concatenated with the outputs from the $f$ emulator inside of the linkedEmulator function. \
+        gOutput - $n \times g$ matrix of the corresponding outputs to the provided inputs. \
+        gLocsPred - $N \times (d+p)$ matrix of untested inputs where $d$ is the number of outputs from $f$ and $p$ is the number of external inputs, $z$. \
+        trend - The name of the specified trend, defaults to linear. \
+        kernel - The name of the desired corr. function, defaults to Matern 5/2. \
+
+**Outputs:**
+
+gModel - Model based on the provided design. Contains range parameters among other things. Currently no nugget is specified - would need to manually edit this function to include one. \
+          gPred - Predictive mean and standard deviation from the PPE for the untested inputs provided (also includes upper and lower 95 values). \
+          
+~-~
+
+*linkedSampling(fLocsPred, gLocsPred, muLs, sigma2Ls, fGamma, gGamma, N, gPred)* - performs linked sampling for the using the resulting values calculated from the parallel partial and linked emulators. \
+**Inputs:** 
+
+fLocsPred - $N \times m$ matrix of untested inputs. \
+          gLocsPred - $N \times (d+p)$ matrix of untested inputs where $d$ is the number of outputs from $f$ and $p$ is the number of external inputs, $z$. \
+          muLs - The $N$ mean predictions from the linked emulator for the output of interest. \
+          sigma2Ls - The $N$ variance predictions from the linked emulator for the output of interest. \
+          fGamma - The range parameters of the inputs from the $f$ emulator. \
+          gGamma - The range parameters of the inputs from the $g$ emulator. \
+          N - The number of testing points. \
+          gPred - The predictive mean from the PPE for $g$. \
+
+**Outputs:** 
+
+A - The $N \times N$ covariance matrix. The predictive variance of the linked emulator is later extracted from its diagonal. \
+          samples - An $N \times 100$ matrix of correlated samples. \
+  
+~-~        
+
+*linkedEmulator(fLocs, fOutput, fLocsPred, zLocs, gOutput, zLocsPred, trend, kernel)* - The function that takes in all of the training and testing data and runs the whole linked emulator. It provides mean and variance predictions, as well as correlated samples. \
+**Inputs:** 
+
+fLocs - $n \times m$ matrix of design/training inputs for the $f$ emulator. \
+        fOutput - $n \times d$ matrix of the corresponding outputs to the provided inputs. \
+        fLocsPred - $N \times m$ matrix of untested inputs for the first layer, $f$. \
+        zLocs - $n \times p$ matrix of external design/training inputs for the $g$ emulator. \
+        gOutput - $n \times g$ matrix of the corresponding outputs to the provided inputs. \
+        zLocsPred - $N \times p$ matrix of untested inputs for the $g$ emulator. \
+        trend - The name of the specified trend, defaults to linear. \
+        kernel - The name of the desired corr. function, defaults to Matern 5/2. \
+        eta - Nugget term for regularizing R matrix during inversion, defaults to 1e-12. \
+
+**Outputs:** 
+
+outlist - List with 3 output components: \
+          means - The predictive mean(s) from the $g$ PPE. \
+          vars - The predictive variance(s) from the linked emulator. \
+          samples - An $N \times 100$ matrix of correlated samples. \
+
+```{r Emulator Functions}
+
+fEmulator <- function(fLocs, fOutput, fLocsPred, kernel = "mat52") {
+  m <- nrow(fLocs)
+  trendMat <- cbind(fLocs, matrix(1,m,1)) #the trend always be this way for f
+  #preprocessing necessary in R so that the matrix concatenates correctly
+  if (is.integer(dim(fLocsPred)) == TRUE)
+  {
+    testTrendMat <- cbind(fLocsPred, 1) #the trend always be this way for f
+  } else {
+    testTrendMat <- cbind(t(as.matrix(fLocsPred)), 1)
+  }
+  
+  #determining size of output and then using the correct optimization based on size
+  switchVal = dim(as.matrix(fOutput))[1] * dim(as.matrix(fOutput))[2]
+  if (switchVal < 10000) {
+    if (kernel == "sq_exp" || kernel == "pow_exp") {
+      fModel <- ppgasp(design=fLocs, response=fOutput, trend=trendMat, kernel_type = 'pow_exp') #ppgasp for f layer
+      fPred <- predict.ppgasp(fModel, fLocsPred, testing_trend = testTrendMat, kernel_type = 'pow_exp')
+    }
+    else if (kernel == "mat32") {
+      fModel <- ppgasp(design=fLocs, response=fOutput, trend=trendMat, kernel_type = 'matern_3_2') #ppgasp for f layer
+      fPred <- predict.ppgasp(fModel, fLocsPred, testing_trend = testTrendMat, kernel_type = 'matern_3_2')
+    }
+    else {
+      fModel <- ppgasp(design=fLocs, response=as.matrix(fOutput), trend=trendMat) #ppgasp for f layer
+      fPred <- predict.ppgasp(fModel, fLocsPred, testing_trend = testTrendMat)
+      # fPred <- predict.ppgasp(fModel, t(as.matrix(fLocsPred)), testing_trend = testTrendMat)
+    }
+  } else {
+      if (kernel == "sq_exp" || kernel == "pow_exp") {
+      fModel <- ppgasp(design=fLocs, response=fOutput, trend=trendMat, kernel_type = 'pow_exp') #ppgasp for f layer
+      fPred <- predict.ppgasp(fModel, fLocsPred, testing_trend = testTrendMat, kernel_type = 'pow_exp', optimization = "nelder-mead")
+      }
+      else if (kernel == "mat32") {
+        fModel <- ppgasp(design=fLocs, response=fOutput, trend=trendMat, kernel_type = 'matern_3_2') #ppgasp for f layer
+        fPred <- predict.ppgasp(fModel, fLocsPred, testing_trend = testTrendMat, kernel_type = 'matern_3_2', optimization = "nelder-mead")
+      }
+      else {
+        fModel <- ppgasp(design=fLocs, response=as.matrix(fOutput), trend=trendMat, optimization = "nelder-mead") #ppgasp for f layer
+        fPred <- predict.ppgasp(fModel, fLocsPred, testing_trend = testTrendMat)
+        # fPred <- predict.ppgasp(fModel, t(as.matrix(fLocsPred)), testing_trend = testTrendMat)
+      }
+  }
+  
+  outList <- list("model" = fModel, "pred" = fPred)
+  return(outList) 
+}
+###
+gEmulator <- function(gLocs, gOutput, gLocsPred, trend = "linear", kernel = "mat52") {
+  m <- nrow(gLocs)
+  numTest <- nrow(gLocsPred)
+  if(trend == 'constant') {
+    trendMat <- matrix(1,m,1)
+    testTrendMat <- matrix(1,numTest,1)
+  }
+  if(trend == 'linear') {
+    trendMat <- cbind(gLocs, matrix(1,m,1))
+    testTrendMat <- cbind(gLocsPred, matrix(1,numTest,1))
+  }
+  
+  #determining size of output and then using the correct optimization based on size
+  switchVal = dim(as.matrix(gOutput))[1] * dim(as.matrix(gOutput))[2]
+  if (switchVal < 10000) {
+    if (kernel == "sq_exp" || kernel == "pow_exp") {
+      gModel<- ppgasp(design=gLocs, response=gOutput, trend=trendMat, kernel_type = 'pow_exp')
+      gPred <- predict.ppgasp(gModel, gLocsPred, testing_trend = testTrendMat, kernel_type = 'pow_exp')
+    }
+    else if (kernel == "mat32") {
+      gModel<- ppgasp(design=gLocs, response=gOutput, trend=trendMat, kernel_type = 'matern_3_2')
+      gPred <- predict.ppgasp(gModel, gLocsPred, testing_trend = testTrendMat, kernel_type = 'matern_3_2')
+    }
+    else {
+      gModel<- ppgasp(design=gLocs, response=gOutput, trend=trendMat)
+      gPred <- predict.ppgasp(gModel, gLocsPred, testing_trend = testTrendMat)
+    }
+  }
+  else {
+    if (kernel == "sq_exp" || kernel == "pow_exp") {
+      gModel<- ppgasp(design=gLocs, response=gOutput, trend=trendMat, kernel_type = 'pow_exp', optimization = "nelder-mead")
+      gPred <- predict.ppgasp(gModel, gLocsPred, testing_trend = testTrendMat, kernel_type = 'pow_exp')
+    }
+    else if (kernel == "mat32") {
+      gModel<- ppgasp(design=gLocs, response=gOutput, trend=trendMat, kernel_type = 'matern_3_2', optimization = "nelder-mead")
+      gPred <- predict.ppgasp(gModel, gLocsPred, testing_trend = testTrendMat, kernel_type = 'matern_3_2')
+    }
+    else {
+      gModel<- ppgasp(design=gLocs, response=gOutput, trend=trendMat, optimization = "nelder-mead")
+      gPred <- predict.ppgasp(gModel, gLocsPred, testing_trend = testTrendMat)
+    }
+  }
+  outList <- list("model" = gModel, "pred" = gPred)
+  return(outList) 
+}
+###
+linkedSampling <- function(fLocsPred, gLocsPred, muLs, sigma2Ls, fGamma, gGamma, N, gPred){
+  
+  A=matrix(1, nrow = N, ncol = N)
+  numFCols = ncol(fLocsPred)
+  if (is.null(numFCols) == TRUE) {
+    numFCols = length(fLocsPred)
+    fLocsPred = matrix(fLocsPred, nrow = 1)
+  }
+  numGCols = ncol(gLocsPred)
+  
+  for (i in 1:N) {
+    for (j in 1:N) {
+      if (i == j) {
+        A[i,j] = sigma2Ls[i]
+      }
+      else if (i != j) {
+        rho_f = 1
+        for (k in 1:numFCols)  {
+          if (nrow(fLocsPred) > 1) {
+            rho_f = rho_f * cKSingle(fLocsPred[i,k],fLocsPred[j,k],fGamma[k]) 
+            rho_f = rho_f * cKSingle(fLocsPred[k],fLocsPred[k],fGamma[k]) 
+          }
+        }
+        tempSig = sqrt(sigma2Ls[i] - 2*rho_f*sqrt(sigma2Ls[i])*sqrt(sigma2Ls[j]) + sigma2Ls[j])
+        rho_eta = 1
+        for (k in 1:numGCols)  {
+          rho_eta = rho_eta * xiSingle(muLs[i], tempSig, gGamma[k], muLs[j])
+        }
+        A[i,j] = sqrt(sigma2Ls[i]) * sqrt(sigma2Ls[j]) * rho_eta * rho_f
+      }
+    }
+  }
+  L = chol(A + eye(N)*0.0000000001) #regularizing the matrix so it is positive definite
+  L = t(L)
+  samples <- matrix(0, nrow = N, ncol = 100)
+  for (i in 1:100) {
+    u = rnorm(N)
+    ysamp = gPred + L%*%as.matrix(u)
+    samples[,i] <- ysamp
+  }
+  outList <- list("A" = A, "samples" = samples) 
+  return(outList)
+  
+}
+###
+
+linkedEmulator <- function(fLocs, fOutput, fLocsPred, zLocs, gOutput, zLocsPred, trend = "linear", kernel = "mat52", eta = 0.000000000001) {
+  #load in correct .cpp file for kernel specified
+  library(Rcpp)
+  setwd("C:/Users/jl541227/Documents/ResearchPapers/Richards_Joey2/Richards_Joey/")
+  
+  if (kernel == "exp") {
+    sourceCpp('linkedEmulatorExponential.cpp') # file with C++ versions of the linked emulator functions for exponential
+  } else if (kernel == "sq_exp" || kernel == "pow_exp") {
+    sourceCpp('linkedEmulatorSquaredExponential.cpp') # file with C++ versions of the linked emulator functions for squared exponential
+  } else if (kernel == "mat32") {
+    sourceCpp('linkedEmulatorMatern32.cpp') # file with C++ versions of the linked emulator functions for Matern 3/2
+  } else {
+    sourceCpp('linkedEmulator.cpp') # file with C++ versions of the linked emulator functions for Matern 5/2
+  }
+  
+  set.seed(9)
+  N <- nrow(as.matrix(fLocsPred))
+  numFInputs <- ncol(fLocs)
+  numFOutputs <- ncol(fOutput)
+  ygpVals <- matrix(0, nrow = N, ncol = numFOutputs)
+  sdVals <- matrix(0, nrow = N, ncol = numFOutputs)
+  gammas <- matrix(0, nrow = numFOutputs, ncol = numFInputs)
+  fGamma <- rep(1, times=numFInputs)
+  #first layer PPE - take in f^D inputs/outputs, take in f^* inputs
+  #a single emulator is constructed for each output variable if we have more than
+  #one. Predictions are more accurate this way.
+  for (jj in 1:numFOutputs) {
+    y <- fOutput[,jj]
+    fVals = fEmulator(fLocs, y, fLocsPred, kernel)
+    
+    ygp = fVals$pred$mean
+    v = fVals$pred$sd
+    ygpVals[,jj] <- ygp
+    sdVals[,jj] <- v
+    gammas[jj,] <- 1/fVals$model@beta_hat
+    for (jjj in 1:numFInputs) {
+      fGamma[jjj] <- fGamma[jjj]*gammas[jj,jjj]
+    }
+  }
+  
+  #possibly put switch in for nelder-mead optimization if design is too large
+  fModel <- fVals$model
+  fPred <- list(mean = ygpVals, sd = sdVals)
+
+  #preprocessing the data so that the matrix concatenates as intended
+  if (is.null(dim(fOutput)) == TRUE) {
+    gLocs <- cbind(matrix(t(fOutput), ncol = 1), zLocs)
+  } else {
+    gLocs <- cbind(fOutput, zLocs)
+  }
+  
+  if (dim(as.matrix(fPred$mean))[1] == 1) { #this isn't quite what we want
+    # gLocsPred <- cbind(t(fPred$mean), zLocsPred)
+    gLocsPred <- cbind(fPred$mean, zLocsPred)
+  } else {
+    gLocsPred <- cbind(fPred$mean, zLocsPred)
+  }
+  
+  #train inputs are called gLocs, train outputs are called gOutput, test inputs are called fLocsPred
+  gVals = gEmulator(gLocs, gOutput, gLocsPred, trend, kernel)
+  gModel <- gVals$model
+  gPred <- gVals$pred
+  
+  muVec = as.matrix(fPred$mean)
+  sigVec = as.matrix(fPred$sd)
+  
+  #number of inputs from f is determined by number of columns in muVec - PPE mean prediction
+  #number of external inputs for g determined by subtracting the f input number from the total in g
+  d <- ncol(muVec)
+  p <- ncol(gLocs) - d
+  in_all <- gLocs
+  wT <- gLocs[,1:d]
+  zT <- gLocs[,(d+1):(d+p)]
+  m <- dim(in_all)[1]
+  # eta <- gModel@nugget #nugget term
+  gSigVec <- gModel@sigma2_hat
+  gGamma <- 1/gModel@beta_hat
+
+  #calculation correlations between training data points
+  c_k <- array(0, dim = c(m, m, (d+p)))
+  for (i in 1:m) {
+    for (j in 1:m) {
+      for (k in 1:(d+p)) {
+        c_k[i,j,k] <- cKSingle(in_all[i,k], in_all[j,k], gGamma[k])
+      }
+    }
+  }
+  for (k in 1:(d+p)) {
+    if (k == 1)
+      R <- c_k[,,k]    
+    else 
+      R <- R * c_k[,,k]
+  }
+  
+  #adding term here to help with regularizing
+  invR <- solve(R + diag(eta, nrow(R), ncol(R)))
+
+  g = ncol(as.matrix(gOutput)) #number of outputs we are interested in
+
+  numTest <- nrow(gLocsPred)
+  #program from here gets split into 4 options:
+  #one output with either a linear or constant trend 
+  #OR
+  #multiple outputs with either a linear or constant trend
+  if (g == 1) {
+    yT <- gOutput
+    if (trend == "constant") {
+      #call 1D constant trend
+      HzT <- matrix(1,m,1)
+      hTilde <- matrix(1,m,1)
+      hats <- solve(t(hTilde) %*% invR %*% hTilde)%*%t(hTilde) %*% invR %*% yT
+      thetaHat <- rep(0, times = ncol(as.matrix(wT)))
+      thetaHat <- as.matrix(thetaHat)
+      betaHat <- as.matrix(hats)
+      sigInvMat <- solve(t(hTilde)%*%invR%*%hTilde)
+      B <- matrix(0,nrow = d, ncol = m)
+      Q <- invR %*% hTilde %*% solve(t(hTilde) %*% invR %*% hTilde) %*% t(hTilde) %*% invR - invR
+      C <- solve(t(hTilde) %*% invR %*% hTilde)
+      muLs <- matrix(c(0), nrow = numTest, ncol = g)
+      sigma2Ls <- matrix(c(0), nrow = numTest, ncol = g)
+      for (i in 1:g) {
+        A <- invR%*%(yT - wT %*% thetaHat - HzT %*% betaHat)
+        for(k in 1:numTest){
+          print(k) #can remove this when package is ready to go live probably
+          Sys.sleep(0.001) #can remove this when package is ready to go live probably
+          flush.console() #can remove this when package is ready to go live probably
+          hZ <- 1
+          
+          iVec <- iFun(gLocsPred[k,], as.matrix(wT), as.matrix(zT), gGamma, muVec[k,], sigVec[k,])
+          B <- bFun(gLocsPred[k,], as.matrix(wT), as.matrix(zT), gGamma, muVec[k,], sigVec[k,])
+          K <- cbind(t(B), iVec%*%t(hZ))
+          J <- jFun(gLocsPred[k,], as.matrix(wT), as.matrix(zT), gGamma, muVec[k,], sigVec[k,])
+          tempOmega <- sigVec[k,]^2
+          Omega <- matrix(diag(tempOmega), ncol = length(tempOmega))
+          P <- blkdiag(Omega, matrix(0,nrow = length(hZ), ncol = length(hZ)))
+          G <- cbind(t(muVec[k,]), t(hZ))
+          G <- t(G)
+          trQJ = 0
+          for (bb in 1:ncol(Q)) {
+            trQJ = trQJ + (Q[bb,] %*% J[,bb])
+          }
+          mu_L <- (t(muVec[k,]) %*% thetaHat) + (t(hZ) %*% betaHat) + (t(iVec) %*% A)
+          sigma2_L <- t(A) %*% (J - iVec%*%t(iVec)) %*% A + gSigVec[i]*(1 + eta + sigInvMat + trQJ - 2*tr(C * t(hTilde) %*% invR %*% iVec))
+          muLs[k, i] <- mu_L
+          sigma2Ls[k, i] <- sigma2_L
+          if(sigma2_L < 0) { 
+            if(sigma2_L < -(10^-7)) {
+              if(sigma2_L < -(10^-7)) {
+                print(paste0("Negative variance at index ", k))
+                print(paste0("Value of ", sigma2_L))
+              }
+            }
+            sigma2Ls[k,i] = abs(sigma2_L)
+          }
+        }
+      }
+      samps = linkedSampling(fLocsPred, gLocsPred, muLs, sigma2Ls, fGamma, gGamma, numTest, gPred$mean)
+    }
+    if (trend == "linear") {
+      #call 1D linear trend
+      HzT <- cbind(zT,matrix(1,m,1))
+      hTilde <- cbind(wT, HzT)
+      hats <- solve(t(hTilde) %*% invR %*% hTilde)%*%t(hTilde) %*% invR %*% yT
+      thetaHat <- as.matrix(hats[1:d,])
+      betaHat <- as.matrix(hats[(d+1):(d+p+1),]) 
+      sigInvMat <- solve(t(hTilde)%*%invR%*%hTilde)
+      B <- matrix(0,nrow = d, ncol = m)
+      Q <- invR %*% hTilde %*% solve(t(hTilde) %*% invR %*% hTilde) %*% t(hTilde) %*% invR - invR
+      C <- solve(t(hTilde) %*% invR %*% hTilde)
+      muLs <- matrix(c(0), nrow = numTest, ncol = g)
+      sigma2Ls <- matrix(c(0), nrow = numTest, ncol = g)
+      for (i in 1:g) {
+        A <- invR%*%(yT - wT %*% thetaHat - HzT %*% betaHat)
+        for(k in 1:numTest){
+          print(k) #can remove this when package is ready to go live probably
+          Sys.sleep(0.001) #can remove this when package is ready to go live probably
+          flush.console() #can remove this when package is ready to go live probably
+          hZ <- c(gLocsPred[k,(d+1):(d+p)],1)
+          
+          iVec <- iFun(gLocsPred[k,], as.matrix(wT), as.matrix(zT), gGamma, muVec[k,], sigVec[k,])
+          B <- bFun(gLocsPred[k,], as.matrix(wT), as.matrix(zT), gGamma, muVec[k,], sigVec[k,])
+          K <- cbind(t(B), iVec%*%t(hZ))
+          J <- jFun(gLocsPred[k,], as.matrix(wT), as.matrix(zT), gGamma, muVec[k,], sigVec[k,])
+          tempOmega <- sigVec[k,]^2
+          if (length(tempOmega) == 1) {
+            Omega <- as.matrix(tempOmega)
+          } else { 
+            Omega <- matrix(diag(tempOmega), ncol = length(tempOmega))
+          }
+          P <- blkdiag(Omega, matrix(0,nrow = length(hZ), ncol = length(hZ)))
+          G <- cbind(t(muVec[k,]), t(hZ))
+          G <- t(G)
+          trQJ = 0
+          for (bb in 1:ncol(Q)) {
+            trQJ = trQJ + (Q[bb,] %*% J[,bb])
+          }
+          mu_L <- (t(muVec[k,]) %*% thetaHat) + (t(hZ) %*% betaHat) + (t(iVec) %*% A)
+          sigma2_L <- t(A) %*% (J - iVec%*%t(iVec)) %*% A + 2*t(thetaHat)%*%(B - muVec[k,] %*% t(iVec)) %*% A + tr(thetaHat %*% t(thetaHat) %*% Omega) + gSigVec[i] *(1 + eta + trQJ + t(G) %*% C %*% G + tr(C %*% P - 2*C %*% t(hTilde) %*% invR %*% K))
+          muLs[k, i] <- mu_L
+          sigma2Ls[k, i] <- sigma2_L
+          if(sigma2_L < 0) { 
+            if(sigma2_L < -(10^-7)) {
+              if(sigma2_L < -(10^-7)) {
+                print(paste0("Negative variance at index ", k))
+                print(paste0("Value of ", sigma2_L))
+              }
+            }
+            sigma2Ls[k,i] = abs(sigma2_L)
+          }
+        }
+      }
+      samps = linkedSampling(fLocsPred, gLocsPred, muLs, sigma2Ls, fGamma, gGamma, numTest, gPred$mean)
+    }
+  }
+  if (g > 1) {
+    if (trend == "constant") {
+      #call 2D constant trend
+      muLs <- matrix(c(0), nrow = numTest, ncol = g)
+      sigma2Ls <- matrix(c(0), nrow = numTest, ncol = g)
+      sampsA <- array(0, dim = c(numTest, numTest, g))
+      sampsSamples <- array(0, dim = c(numTest, 100, g))
+      HzT <- matrix(1,m,1)
+      hTilde <- matrix(1,m,1)
+      hats <- solve(t(hTilde) %*% invR %*% hTilde)%*%t(hTilde) %*% invR %*% gOutput
+      for (i in 1:g) {
+        yT <- gOutput[,i]
+        thetaHat <- rep(0, times = ncol(wT))
+        betaHat <- hats[,i]
+        
+        sigInvMat <- solve(t(hTilde)%*%invR%*%hTilde) #saving computation time since this doesn't change each iteration
+        B <- matrix(0,nrow = d, ncol = m)
+        Q <- invR %*% hTilde %*% solve(t(hTilde) %*% invR %*% hTilde) %*% t(hTilde) %*% invR - invR
+        C <- solve(t(hTilde) %*% invR %*% hTilde)
+        A <- invR%*%(yT - wT %*% thetaHat - HzT %*% betaHat)
+        
+        for(k in 1:numTest){
+          print(k) #can remove this when package is ready to go live probably
+          Sys.sleep(0.001) #can remove this when package is ready to go live probably
+          flush.console() #can remove this when package is ready to go live probably
+          hZ <- 1
+          
+          iVec <- iFun(gLocsPred[k,], as.matrix(wT), as.matrix(zT), gGamma, muVec[k,], sigVec[k,])
+          B <- bFun(gLocsPred[k,], as.matrix(wT), as.matrix(zT), gGamma, muVec[k,], sigVec[k,])
+          K <- cbind(t(B), iVec%*%t(hZ))
+          J <- jFun(gLocsPred[k,], as.matrix(wT), as.matrix(zT), gGamma, muVec[k,], sigVec[k,])
+          tempOmega <- sigVec[k,]^2
+          Omega <- matrix(diag(tempOmega), ncol = length(tempOmega))
+
+          P <- blkdiag(Omega, matrix(0,nrow = length(hZ), ncol = length(hZ)))
+          G <- cbind(t(muVec[k,]), t(hZ))
+          G <- t(G)
+          trQJ = 0
+          for (bb in 1:ncol(Q)) {
+            trQJ = trQJ + (Q[bb,] %*% J[,bb])
+          }
+          mu_L <- (t(muVec[k,]) %*% thetaHat) + (t(hZ) %*% betaHat) + (t(iVec) %*% A)
+          sigma2_L <- t(A) %*% (J - iVec%*%t(iVec)) %*% A + gSigVec[i]*(1 + eta + sigInvMat + trQJ - 2*tr(C * t(hTilde) %*% invR %*% iVec))
+          muLs[k, i] <- mu_L
+          sigma2Ls[k, i] <- sigma2_L
+          if(sigma2_L < 0) { #add some sort of flag here
+            print(paste0("Negative variance at index ", k))
+            print(paste0("Value of ", sigma2_L))
+            sigma2Ls[k,i] = abs(sigma2_L)
+          }
+        }
+        tempSamps = linkedSampling(fLocsPred, gLocsPred, muLs[,i], sigma2Ls[,i], fGamma, gGamma, numTest, gPred$mean[,i])
+        sampsA[,,i] = tempSamps$A
+        sampsSamples[,,i] = tempSamps$samples
+      }
+      samps = list(A = sampsA, samples = sampsSamples)
+    }
+    if (trend == "linear") {
+      #call 2D linear trend
+      muLs <- matrix(c(0), nrow = numTest, ncol = g)
+      sigma2Ls <- matrix(c(0), nrow = numTest, ncol = g)
+      sampsA <- array(0, dim = c(numTest, numTest, g))
+      sampsSamples <- array(0, dim = c(numTest, 100, g))
+      HzT <- cbind(zT,matrix(1,m,1))
+      hTilde <- cbind(wT, HzT)
+      hats <- solve(t(hTilde) %*% invR %*% hTilde)%*%t(hTilde) %*% invR %*% gOutput
+      for (i in 1:g) {
+        yT <- gOutput[,i]
+        
+        thetaHat <- hats[1:d,i]
+        betaHat <- hats[(d+1):(d+p+1),i]
+        
+        sigInvMat <- solve(t(hTilde)%*%invR%*%hTilde) #saving computation time since this doesn't change each iteration
+        B <- matrix(0,nrow = d, ncol = m)
+        Q <- invR %*% hTilde %*% solve(t(hTilde) %*% invR %*% hTilde) %*% t(hTilde) %*% invR - invR
+        C <- solve(t(hTilde) %*% invR %*% hTilde)
+        
+        A <- invR%*%(yT - wT %*% thetaHat - HzT %*% betaHat)
+        for(k in 1:numTest){
+          print(k) #can remove this when package is ready to go live probably
+          Sys.sleep(0.001) #can remove this when package is ready to go live probably
+          flush.console() #can remove this when package is ready to go live probably
+          hZ <- c(gLocsPred[k,(d+1):(d+p)],1)
+          
+          iVec <- iFun(gLocsPred[k,], as.matrix(wT), as.matrix(zT), gGamma, muVec[k,], sigVec[k,])
+          B <- bFun(gLocsPred[k,], as.matrix(wT), as.matrix(zT), gGamma, muVec[k,], sigVec[k,])
+          K <- cbind(t(B), iVec%*%t(hZ))
+          J <- jFun(gLocsPred[k,], as.matrix(wT), as.matrix(zT), gGamma, muVec[k,], sigVec[k,])
+          tempOmega <- sigVec[k,]^2
+          Omega <- matrix(diag(tempOmega), ncol = length(tempOmega))
+          P <- blkdiag(Omega, matrix(0,nrow = length(hZ), ncol = length(hZ)))
+          G <- cbind(t(muVec[k,]), t(hZ))
+          G <- t(G)
+          trQJ = 0
+          for (bb in 1:ncol(Q)) {
+            trQJ = trQJ + (Q[bb,] %*% J[,bb])
+          }
+          mu_L <- (t(muVec[k,]) %*% thetaHat) + (t(hZ) %*% betaHat) + (t(iVec) %*% A)
+          sigma2_L <- t(A) %*% (J - iVec%*%t(iVec)) %*% A + 2*t(thetaHat)%*%(B - muVec[k,] %*% t(iVec)) %*% A + tr(thetaHat %*% t(thetaHat) %*% Omega) + gSigVec[i] *(1 + eta + trQJ + t(G) %*% C %*% G + tr(C %*% P - 2*C %*% t(hTilde) %*% invR %*% K))
+          muLs[k, i] <- mu_L
+          sigma2Ls[k, i] <- sigma2_L
+          if(sigma2_L < 0) { 
+            print(paste0("Negative variance at index ", k))
+            print(paste0("Value of ", sigma2_L))
+            sigma2Ls[k,i] = abs(sigma2_L)
+          }
+        }
+        tempSamps = linkedSampling(fLocsPred, gLocsPred, muLs[,i], sigma2Ls[,i], fGamma, gGamma, numTest, gPred$mean[,i])
+        sampsA[,,i] = tempSamps$A
+        sampsSamples[,,i] = tempSamps$samples
+      }
+      samps = list(A = sampsA, samples = sampsSamples)
+    }
+  }
+
+  outList <- list("means" = gPred$mean, "vars" = samps$A, "samples" = samps$samples)
+  return(outList)
+}
+```
+
+Here we are using the following 4 toy functions as the functions of interest for generating our output:
+$$w_1 = f_1(x_1, x_2) = \sin(x_1) + x_2^2$$
+$$w_2 = f_2(x_1, x_2) = \sin(3x_1 \cos(\pi x_2))$$
+$$g_1(w_1, w_2, z_1, z_2) = \cos(3z_2)\sin(3w_1) + \sin(3z_1)\cos(3w_2)$$
+
+$$g_2(w_1, w_2, z_1, z_2) = \cos(4z_2)\sin(2w_1) + \sin(4z_1)\cos(2w_2)$$
+
+```{r Toy functions}
+f_1 <- function(x1, x2) {
+  return (sin(x1) + x2^2)
+}
+
+f_2 <- function(x1, x2) {
+  return (sin(3*x1*cos(pi*x2)))
+}
+
+g_1 <- function(w1, w2, z1, z2) {
+  return (cos(3*z2)*sin(3*w1) + sin(3*z1)*cos(3*w2))
+}
+
+g_2 <- function(w1, w2, z1, z2) {
+  return (cos(4*z2)*sin(2*w1) + sin(4*z1)*cos(2*w2))
+}
+
+```
+
+For the training data for this problem, we vary the values $x_1, x_2, z_1, z_2$ between 0 and 2. When running the emulator, we hold three of the variables $(x_2, z_1, z_2)$ constant around 1 and vary the other $(x_1)$ on a grid from 0 to 2. \
+\ 
+When generating or importing data, the organization of the data is important. In order for this setup to work, the data must be organized as follows: \
+**Inputs:** Rows correspond to distinct parameter sets, columns correspond to different input parameters. \
+**Outputs:** Rows correspond to distinct parameter sets, columns correspond to different output parameters. 
+
+
+```{r Data Generation}
+#load other necessary packages (RobustGaSP, readxl, etc.)
+library(lhs)
+library(RobustGaSP)
+library(readxl)
+library(pracma) #needed for blkdiag
+library(psych) #needed for tr
+
+#load/generate data
+set.seed(9)
+N = 201
+m = 300
+numX = 2
+x1=randomLHS(m,1)
+x1 = x1*2
+x2=randomLHS(m,1)
+x2 = x2*2
+
+w1=f_1(x1, x2)
+w2=f_2(x1, x2)
+fLocs <- cbind(x1, x2)
+trendMat <- cbind(fLocs,matrix(1,m,1))
+
+xx1 = seq(0,2, length.out = N)
+xx2 <- rep(1, times = N)
+xx2 = xx2 + (runif(N)*(10^-7))
+fLocsPred <- cbind(xx1, xx2)
+testTrendMat <- cbind(fLocsPred,matrix(1,N,1))
+
+ygpVals <- randomLHS(N,2)
+ygpVals <- ygpVals * 0
+sdVals <- randomLHS(N,2)
+sdVals <- sdVals * 0
+fOutput <- cbind(w1,w2)
+
+ndp=dim(fLocs)[1]
+numX <- dim(fLocs)[2]
+
+
+w <- fOutput
+z1 <- randomLHS(m,1)
+z1 <- z1 * 2
+z2 <- randomLHS(m,1)
+z2 <- z2 * 2
+z <- cbind(z1, z2)
+zLocs <- z
+gOutput <- cbind(g_1(w[,1], w[,2], z[,1], z[,2]), g_2(w[,1], w[,2], z[,1], z[,2]))
+
+zT1 <- rep(1, times = N)
+zT1 = zT1 + (runif(N)*(10^-7))
+zT2 <- rep(1, times = N)
+zT2 = zT2 + (runif(N)*(10^-7))
+zTest <- cbind(zT1, zT2)
+zz <- zTest
+zLocsPred <- zTest
+
+ww1=f_1(xx1, xx2)
+ww2=f_2(xx1, xx2)
+ww <- cbind(ww1,ww2)
+gOutputTest <- cbind(g_1(ww[,1], ww[,2], zz[,1], zz[,2]), g_2(ww[,1], ww[,2], zz[,1], zz[,2]))
+
+```
+
+Now that we have all of the data either imported or generated, we define our trend and kernel of choice. Once we have that, we call the linkedEmulator function to perform all of the calculations - including all calls of the PPE.
+
+```{r Linked Emulator}
+
+#specify trend
+trend = 'linear'
+kernel = "pow_exp"
+
+#call linked emulator
+lE <- linkedEmulator(fLocs, fOutput, fLocsPred, zLocs, gOutput, zLocsPred, trend, kernel)
+
+```
+
+
+
+```{r Plotting}
+sigma2s <- diag(lE$vars[,,1])
+library(ggplot2)
+plotXs <- matrix(rep(fLocsPred[,1], times=100), nrow = N)
+plotRuns <- t(matrix(rep(1:100, times=N), ncol = N))
+df <- data.frame(x = as.vector(plotXs), y = as.vector(lE$samples[,,1]), runId = as.vector(plotRuns))
+g2 <- ggplot(df,aes(x = x, y = y)) + geom_line(aes(color=factor(runId)))
+df2 <- data.frame(x = fLocsPred[,1], mu = lE$means[,1], lb = lE$means[,1] - 1.96*sqrt(sigma2s), ub = lE$means[,1] + 1.96*sqrt(sigma2s), trueVals = gOutputTest[,1])
+g2 <- g2 + geom_line(data = df2, aes(x = x, y = mu), lwd=1)
+g2 <- g2 + geom_line(data = df2, aes(x = x, y = lb), lwd=1, linetype = "dashed")
+g2 <- g2 + geom_line(data = df2, aes(x = x, y = ub), lwd=1, linetype = "dashed")
+g2 <- g2 + geom_line(data = df2, aes(x = x, y = trueVals), lwd=1, color = "blue")
+g2 <- g2 + theme(legend.position = "none")
+g2
+
+
+sigma2s <- diag(lE$vars[,,2])
+df <- data.frame(x = as.vector(plotXs), y = as.vector(lE$samples[,,2]), runId = as.vector(plotRuns))
+g3 <- ggplot(df,aes(x = x, y = y)) + geom_line(aes(color=factor(runId)))
+
+df2 <- data.frame(x = fLocsPred[,1], mu = lE$means[,2], lb = lE$means[,2] - 1.96*sqrt(sigma2s), ub = lE$means[,2] + 1.96*sqrt(sigma2s), trueVals = gOutputTest[,2])
+g3 <- g3 + geom_line(data = df2, aes(x = x, y = mu), lwd=1)
+g3 <- g3 + geom_line(data = df2, aes(x = x, y = lb), lwd=1, linetype = "dashed")
+g3 <- g3 + geom_line(data = df2, aes(x = x, y = ub), lwd=1, linetype = "dashed")
+g3 <- g3 + geom_line(data = df2, aes(x = x, y = trueVals), lwd=1, color = "blue")
+g3 <- g3 + theme(legend.position = "none")
+g3
+
+
+```
+
+```{r PCA Functions}
+
+varN <- function(data) {
+  total = 0
+  for (i in 1:length(data)) {
+    total = total + (data[i] - mean(data))^2
+  }
+  variance = total/length(data)
+  return (variance)
+}
+
+# pca_calculation function performs Principal Component Analysis on the given data 
+# and returns the principal components based on the user-defined number of modes.
+pca_calculation <- function(data, user_modes) {
+  #Compute the mean of each column (feature) in the data.
+  Xbartemp = colMeans(data)
+  Xbarvals <- rep(Xbartemp, times = nrow(data))
+  Xbar <- matrix(Xbarvals, nrow = ncol(data), ncol = nrow(data))
+  Xbar <- t(Xbar)
+
+  #Center the data by subtracting the mean.
+  X = t(data - Xbar)
+
+  # Calculate the covariance matrix A.
+  A = X %*% t(X)
+  
+  #Compute the Singular Value Decomposition (SVD) of the centered data.
+  svdTerms <- svd(X)
+  E <- svdTerms$u
+  D <- svdTerms$d
+  V <- svdTerms$v
+  P = t(E)
+  
+  #Check if the user specified the number of modes.
+  if (user_modes != 0) {
+    num_modes = user_modes
+    total_var_z = 0
+  }
+  else {
+    #If not specified, compute the principal components.
+    z = t(P %*% X)
+    #Compute the variance of each principal component.
+    var_z <- rep(0, times = ncol(z))
+    for (j in 1:ncol(z)) {
+      var_z[j] = varN(z[,j])
+    }
+    
+    #Calculate the total variance.
+    sum_var_z = sum(var_z)
+    
+    #Compute the percentage of variance explained by each mode.
+    total_var_z = (var_z / sum_var_z) * 100
+    #Retain the number of modes required to explain at least 95% of the total variance.
+    #Should this be 95 instead of 90?
+    for (i in 1:10) {
+      if (sum(total_var_z[1:i]) >= 90) {
+        break
+      }
+    }
+    num_modes = i
+  }
+  
+  #Retain only the first num_modes principal components.
+  P = P[1:num_modes,]
+  z = t(P %*% X)
+    
+  #Normalize the retained principal components to be in the range [0, 1].
+  x0 = 0 
+  x1 = 1
+  temp <- matrix(0, nrow = length(z[,1]), ncol = num_modes)
+  for (p in 1:num_modes) {
+    z_ub = max(z[, p])
+    z_lb = min(z[, p])
+    z_norm = (x1 - x0) * (z[, p] - z_lb) / (z_ub - z_lb) + x0
+    temp[, p] = t(z_norm)
+  }
+  
+  z = temp
+  
+  outList <- list("z" = z, "num_modes" = num_modes, "total_var_z" = total_var_z)
+  return(outList)
+  
+}
+
+```
+
+Now we have an example using some imported data. This data is from a two-permeability coupled fluid flow and mechanical deformation Terzaghi consolidation problem.
+
+```{r Imported Data Example}
+
+library(R.matlab)
+path <- system.file("mat-files", package = "R.matlab") #need note on how to access this folder
+#Should be in something like
+#C:\Users\thisUder\AppData\Local\R\win-library\4.2\R.matlab
+pathname <- file.path(path, "Fig7data.mat")
+data <- readMat(pathname)
+
+tVal = 100 # Number of design runs
+fInputs <- data$xxall
+zInputs <- data$yyall
+gall <- data$gall[,-1]
+
+fall <- data$fall[,-1]
+nc <- ncol(gall)
+# gOutput = normG[1:tVal,] # Pressure values
+gOutput = gall[1:tVal,]
+fOutputAll = fall[1:tVal,] # Porosity Values
+
+fLocs = fInputs[1:tVal,] # Input to the inside emulator (f)
+zLocs = zInputs[1:tVal,] # Input to the outside emulator (g)
+
+#Perform pca on the data to determine relevant inputs
+pcaValues <- pca_calculation(fOutputAll, 0)
+fOutput <- pcaValues$z 
+num_modes <- pcaValues$num_modes
+total_var_z <- pcaValues$total_var_z
+
+#Predicting each of the pressure curves from the testing inputs.
+tst <- (nrow(gall)-tVal) #number of LOO experiments to perform
+g <- ncol(gOutput) #number of output variables
+saveMus <- matrix(0, nrow = g, ncol = tst)
+saveSigs <- matrix(0, nrow = g, ncol = tst)
+
+trend = 'constant'
+kernel = "pow_exp"
+
+for (pp in 1:2) { #for package we probably don't to do all of them
+  fLocsPred <- as.matrix(fInputs[tVal+pp,]) #testing data for inside emulator
+  fLocsPred <- t(fLocsPred) #testing data for inside emulator
+  zLocsPred <- as.matrix(zInputs[tVal+pp,]) #testing data for the outside emulator
+  zLocsPred <- t(zLocsPred) #testing data for the outside emulator
+  
+  print(pp)
+  Sys.sleep(0.001)
+  flush.console()
+  
+  etaVal = 0.000001
+  
+  lE <- linkedEmulator(fLocs, fOutput, as.matrix(fLocsPred), zLocs, gOutput, as.matrix(zLocsPred), trend, kernel, etaVal)
+  saveMus[,pp] <- lE$means
+  saveSigs[,pp] <- lE$vars
+}
+
+```
