@@ -822,10 +822,10 @@ g <- ncol(gOutput) #number of output variables
 saveMus <- matrix(0, nrow = g, ncol = tst)
 saveSigs <- matrix(0, nrow = g, ncol = tst)
 
-trend = 'constant'
+trend = 'linear'
 kernel = "pow_exp"
 
-for (pp in 1:2) { #for package we probably don't to do all of them
+for (pp in 1:tst) {
   fLocsPred <- as.matrix(fInputs[tVal+pp,]) #testing data for inside emulator
   fLocsPred <- t(fLocsPred) #testing data for inside emulator
   zLocsPred <- as.matrix(zInputs[tVal+pp,]) #testing data for the outside emulator
